@@ -1,76 +1,46 @@
-import express from "express";
-import fetch from "node-fetch";
-import cors from "cors";
-import dotenv from "dotenv";
+async function fetchImages(prompt) {
+    try {
+        imageContainerText.innerText = "Generating image... Please wait 15-150 seconds.";
+        imageContainer.style.display = "block";
+        imageGenerated.src = ""; // clear previous image
 
-dotenv.config();
-const app = express();
-app.use(express.json());
-app.use(cors());
+        const response = await fetch("/api/generate-image", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({ prompt })
+        });
 
-const API_KEY = process.env.FREEPIK_API_KEY; // store your key in .env
+        console.log("Raw response status:", response.status, response.statusText);
+        const text = await response.text().catch(() => null);
+        console.log("Raw response text:", text);
 
-// Route to start image generation
-app.post("/generate-image", async (req, res) => {
-  try {
-    const { prompt } = req.body;
-    if (!prompt) return res.status(400).json({ error: "Prompt is required" });
+        // try parse JSON safely
+        let data;
+        try {
+            data = text ? JSON.parse(text) : null;
+        } catch (err) {
+            console.error("Failed to parse JSON from backend:", err);
+            imageContainerText.innerText = "Error: backend returned invalid JSON.";
+            return;
+        }
 
-    // Step 1: Start the AI generation
-    const startResp = await fetch("https://api.freepik.com/v1/ai/mystic", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-freepik-api-key": API_KEY,
-      },
-      body: JSON.stringify({
-        prompt,
-        resolution: "2k",
-        model: "realism",
-      }),
-    });
+        if (!response.ok) {
+            console.error("Backend returned non-OK:", response.status, data);
+            imageContainerText.innerText = data?.message || `Server error (${response.status}).`;
+            return;
+        }
 
-    const startData = await startResp.json();
-
-    if (!startData.data || !startData.data.task_id) {
-      return res.status(500).json({ error: "Failed to start generation" });
+        // existing handling
+        if (data && data.images && data.images.length > 0) {
+            imageGenerated.src = data.images[0];
+            imageContainerText.innerText = "Here is your generated image:";
+        } else {
+            imageContainerText.innerText = data?.message || "No image was generated. Try a more descriptive prompt.";
+        }
+    } catch (error) {
+        console.error("Fetch error:", error);
+        imageContainerText.innerText = "Error generating image. Please try again later.";
     }
-
-    const taskId = startData.data.task_id;
-    let status = "IN_PROGRESS";
-    let generatedImages = [];
-    let attempts = 0;
-    const maxAttempts = 10; // stop after ~150 sec
-
-    // Step 2: Poll every 15 seconds until completion
-    while (status === "IN_PROGRESS" && attempts < maxAttempts) {
-      attempts++;
-      console.log(`Checking status... attempt ${attempts}`);
-
-      await new Promise((r) => setTimeout(r, 15000)); // 15 sec wait
-
-      const checkResp = await fetch(
-        `https://api.freepik.com/v1/ai/mystic/${taskId}`,
-        { headers: { "x-freepik-api-key": API_KEY } }
-      );
-      const checkData = await checkResp.json();
-
-      if (checkData.data) {
-        status = checkData.data.status;
-        generatedImages = checkData.data.generated || [];
-        console.log("Current status:", status, "Images:", generatedImages.length);
-      }
-    }
-
-    if (generatedImages.length > 0) {
-      res.json({ images: generatedImages });
-    } else {
-      res.json({ images: [], message: "No image was generated. Try a more descriptive prompt." });
-    }
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to generate image" });
-  }
-});
-
-app.listen(3000, () => console.log("✅ Server running on http://localhost:3000"));
+}
