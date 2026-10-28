@@ -1,153 +1,272 @@
 // server.mjs
+
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import fetch from "node-fetch";
 
 dotenv.config();
+
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
-const allowedOrigin = process.env.ALLOWED_ORIGIN || "*";
-app.use(cors({ origin: allowedOrigin }));
+app.use(
+  cors({
+    origin: process.env.ALLOWED_ORIGIN || "*"
+  })
+);
 
-const API_KEY = process.env.FREEPIK_API_KEY;
-if (!API_KEY) console.warn("FREEPIK_API_KEY not set");
-
+const API_KEY = process.env.PIXAZO_API_KEY;
 const PORT = Number(process.env.PORT) || 3000;
 
-// in-memory task store
-// taskId -> { status: "IN_PROGRESS"|"COMPLETED"|"FAILED", images: [...], message, createdAt }
+const GENERATE_URL =
+  "https://gateway.pixazo.ai/gpt-image-2-5-flare/v1/text-to-image";
+
+const STATUS_URL =
+  "https://gateway.pixazo.ai/v2/requests/status/";
+
 const tasks = new Map();
 
 function genTaskId() {
   return "t_" + Math.random().toString(36).slice(2, 10);
 }
 
-// background poller for a single task
-async function pollFreepikTask(taskId, freepikTaskId, pollIntervalMs = 15000, maxAttempts = 20) {
-  let attempts = 0;
+async function readJson(response) {
+  const text = await response.text();
+
   try {
-    while (attempts < maxAttempts) {
-      attempts++;
-      await new Promise((r) => setTimeout(r, pollIntervalMs));
-
-      const checkResp = await fetch(`https://api.freepik.com/v1/ai/mystic/${freepikTaskId}`, {
-        headers: { "x-freepik-api-key": API_KEY }
-      });
-
-      let checkData;
-      try {
-        checkData = await checkResp.json();
-      } catch (e) {
-        console.warn(`Failed to parse Freepik status JSON:`, e);
-        continue;
-      }
-
-      console.log(`Task poll ${taskId} attempt ${attempts} status:`, checkData?.data?.status);
-
-      const status = checkData?.data?.status;
-      const generated = checkData?.data?.generated ?? [];
-
-      if (status === "COMPLETED" && generated.length > 0) {
-        tasks.set(taskId, { status: "COMPLETED", images: generated, message: "Completed", createdAt: Date.now() });
-        return;
-      } else if (status === "FAILED") {
-        tasks.set(taskId, { status: "FAILED", images: [], message: checkData?.error?.message || "Generation failed", createdAt: Date.now() });
-        return;
-      } else {
-        // still in progress -> update record (optional)
-        tasks.set(taskId, { status: "IN_PROGRESS", images: [], message: "In progress", createdAt: Date.now() });
-      }
-    }
-
-    // max attempts reached
-    tasks.set(taskId, { status: "FAILED", images: [], message: "Timeout polling provider", createdAt: Date.now() });
-  } catch (err) {
-    console.error("pollFreepikTask error:", err);
-    tasks.set(taskId, { status: "FAILED", images: [], message: "Server error while polling", createdAt: Date.now() });
+    return JSON.parse(text);
+  } catch {
+    return { message: text || "Empty API response" };
   }
 }
 
-// POST /generate-image -> start job, return taskId immediately
+async function pollPixazoTask(taskId, requestId) {
+  const maxAttempts = Number(process.env.MAX_POLL_ATTEMPTS) || 60;
+  const interval = Number(process.env.POLL_INTERVAL_MS) || 5000;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, interval));
+
+    try {
+      const response = await fetch(
+        STATUS_URL + encodeURIComponent(requestId),
+        {
+          headers: {
+            "Ocp-Apim-Subscription-Key": API_KEY,
+            "Cache-Control": "no-cache"
+          }
+        }
+      );
+
+      const data = await readJson(response);
+
+      if (!response.ok) {
+        console.error("Pixazo status error:", response.status, data);
+
+        if ([401, 403, 404].includes(response.status)) {
+          tasks.set(taskId, {
+            status: "FAILED",
+            images: [],
+            message: "Unable to retrieve Pixazo task status",
+            createdAt: Date.now()
+          });
+          return;
+        }
+
+        continue;
+      }
+
+      const status = String(data.status || "").toUpperCase();
+
+      console.log(`Task ${taskId}: ${status}`);
+
+      if (status === "COMPLETED") {
+        const media = data.output?.media_url;
+        const images = Array.isArray(media)
+          ? media
+          : typeof media === "string"
+            ? [media]
+            : [];
+
+        if (!images.length) {
+          tasks.set(taskId, {
+            status: "FAILED",
+            images: [],
+            message: "Pixazo completed without returning an image URL",
+            createdAt: Date.now()
+          });
+          return;
+        }
+
+        tasks.set(taskId, {
+          status: "COMPLETED",
+          images,
+          message: "Image generated successfully",
+          createdAt: Date.now()
+        });
+        return;
+      }
+
+      if (["FAILED", "ERROR"].includes(status)) {
+        tasks.set(taskId, {
+          status: "FAILED",
+          images: [],
+          message:
+            typeof data.error === "string"
+              ? data.error
+              : data.error?.message || "Pixazo generation failed",
+          createdAt: Date.now()
+        });
+        return;
+      }
+
+      tasks.set(taskId, {
+        status: "IN_PROGRESS",
+        images: [],
+        message: "Image generation in progress",
+        createdAt: Date.now()
+      });
+    } catch (error) {
+      console.error("Pixazo polling error:", error.message);
+    }
+  }
+
+  tasks.set(taskId, {
+    status: "FAILED",
+    images: [],
+    message: "Generation timed out. Please try again.",
+    createdAt: Date.now()
+  });
+}
+
 app.post("/generate-image", async (req, res) => {
   try {
-    const { prompt } = req.body;
-    if (!prompt) return res.status(400).json({ error: "Prompt is required" });
+    if (!API_KEY) {
+      return res.status(500).json({
+        error: "PIXAZO_API_KEY is missing in server environment variables"
+      });
+    }
 
-    // call Freepik to create a job
-    const startResp = await fetch("https://api.freepik.com/v1/ai/mystic", {
+    const prompt =
+      typeof req.body?.prompt === "string"
+        ? req.body.prompt.trim()
+        : "";
+
+    if (!prompt) {
+      return res.status(400).json({
+        error: "Prompt is required"
+      });
+    }
+
+    const response = await fetch(GENERATE_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-freepik-api-key": API_KEY
+        "Cache-Control": "no-cache",
+        "Ocp-Apim-Subscription-Key": API_KEY
       },
-      body: JSON.stringify({
-        prompt,
-        // reduce resolution to speed up as needed:
-        resolution: process.env.DEFAULT_RESOLUTION || "1k",
-        model: process.env.DEFAULT_MODEL || "realism"
-      })
+      body: JSON.stringify({ prompt })
     });
 
-    if (!startResp.ok) {
-      const txt = await startResp.text().catch(() => null);
-      console.error("Start generation failed:", startResp.status, txt);
-      return res.status(502).json({ error: "Failed to start generation", details: txt });
+    const data = await readJson(response);
+
+    if (!response.ok) {
+      console.error(
+        "Pixazo generation error:",
+        response.status,
+        data
+      );
+
+      return res.status(502).json({
+        error: "Failed to start generation",
+        details:
+          data.message ||
+          data.error ||
+          `Pixazo returned HTTP ${response.status}`
+      });
     }
 
-    const startData = await startResp.json();
-    const freepikTaskId = startData?.data?.task_id;
-    if (!freepikTaskId) {
-      console.error("No task_id in start response:", startData);
-      return res.status(500).json({ error: "Failed to start generation" });
+    const requestId = data.request_id;
+
+    if (!requestId) {
+      console.error("Pixazo response missing request_id:", data);
+
+      return res.status(502).json({
+        error: "Pixazo did not return a request ID"
+      });
     }
 
-    // generate our own task id, store initial state, and start background polling
     const taskId = genTaskId();
-    tasks.set(taskId, { status: "IN_PROGRESS", images: [], message: "Started", createdAt: Date.now() });
 
-    // background (do not await)
-    (async () => {
-      // poll interval and attempts can be configured via env
-      const pollIntervalMs = Number(process.env.POLL_INTERVAL_MS) || 15000;
-      const maxAttempts = Number(process.env.MAX_POLL_ATTEMPTS) || 20;
-      await pollFreepikTask(taskId, freepikTaskId, pollIntervalMs, maxAttempts);
-    })();
+    tasks.set(taskId, {
+      status: "IN_PROGRESS",
+      images: [],
+      message: "Generation started",
+      createdAt: Date.now()
+    });
 
-    // return to client immediately
-    return res.status(202).json({ task_id: taskId, status: "IN_PROGRESS", message: "Task accepted" });
-  } catch (err) {
-    console.error("generate-image POST error:", err);
-    return res.status(500).json({ error: "Server error starting generation" });
+    // Poll in the background without delaying the initial response.
+    pollPixazoTask(taskId, requestId).catch((error) => {
+      console.error("Background task error:", error.message);
+
+      tasks.set(taskId, {
+        status: "FAILED",
+        images: [],
+        message: "Server error while checking generation status",
+        createdAt: Date.now()
+      });
+    });
+
+    return res.status(202).json({
+      task_id: taskId,
+      status: "IN_PROGRESS",
+      message: "Image generation started"
+    });
+  } catch (error) {
+    console.error("Generate image error:", error.message);
+
+    return res.status(500).json({
+      error: "Server error starting generation"
+    });
   }
 });
 
-// GET /status/:taskId -> return current state and images if available
 app.get("/status/:taskId", (req, res) => {
-  try {
-    const { taskId } = req.params;
-    if (!taskId) return res.status(400).json({ error: "Missing taskId" });
+  const task = tasks.get(req.params.taskId);
 
-    const task = tasks.get(taskId);
-    if (!task) return res.status(404).json({ status: "NOT_FOUND", message: "Task not found" });
-
-    return res.json({ status: task.status, images: task.images || [], message: task.message });
-  } catch (err) {
-    console.error("status endpoint error:", err);
-    return res.status(500).json({ error: "Server error retrieving status" });
+  if (!task) {
+    return res.status(404).json({
+      status: "NOT_FOUND",
+      message: "Task not found"
+    });
   }
+
+  return res.json({
+    status: task.status,
+    images: task.images,
+    message: task.message
+  });
 });
 
-// optional: cleanup old tasks (every hour)
+app.get("/", (req, res) => {
+  res.json({
+    status: "ok",
+    provider: "Pixazo"
+  });
+});
+
+// Clean up old task records.
 setInterval(() => {
-  const TTL = Number(process.env.TASK_TTL_MS) || 1000 * 60 * 60; // 1 hour
+  const ttl = Number(process.env.TASK_TTL_MS) || 3600000;
   const now = Date.now();
-  for (const [k, v] of tasks.entries()) {
-    if (v.createdAt && now - v.createdAt > TTL) tasks.delete(k);
+
+  for (const [id, task] of tasks.entries()) {
+    if (now - task.createdAt > ttl) {
+      tasks.delete(id);
+    }
   }
-}, 1000 * 60 * 10); // run every 10 minutes
+}, 10 * 60 * 1000);
 
-app.get("/", (req, res) => res.json({ status: "ok" }));
-
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Pixazo image server listening on port ${PORT}`);
+});
